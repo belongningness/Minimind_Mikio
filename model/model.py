@@ -1,7 +1,7 @@
 from transformers import PretrainedConfig
 
 
-# huggingface的一个类，继承模型参数，可以传到HuggingFace上
+# huggingface的一个类，继承模型参数，可以传入HuggingFace
 class MokioMindConfig(PretrainedConfig):
     model_type = "mokiomind"
 
