@@ -127,7 +127,7 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
             # i小就是高频区变化快；i大就是低频区
             inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
 
-            # 划分高低纬度
+            # 划分高低维度
             # low 不需要缩放的高频部分的终点
             # high 需要缩放的低频部分的起点
             # 整个[0,dim//2]被划分为三段: [0, low)不需要缩放的高频, [low, high]中频, (high, dim//2]需要缩放的低频
@@ -152,8 +152,14 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
     freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
     return freqs_cos, freqs_sin
 
+# q k: (batch, heads, seq_len, dim); cos sin: (seq_len, dim); 
+# unsqueeze_dim: 让 cos/sin 在 batch、head 维度上自动 broadcast，以适应q k维度
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    # rotate_half函数将(x1, x2) ->(-x2, x1)，为了方便下面的旋转
     def rotate_half(x): return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
+    # 第一项q * cos.unsqueeze(unsqueeze_dim)：q * cosθ = (q1 cosθ, q2 cosθ)
+    # 第二项rotate_half(q) * sin.unsqueeze(unsqueeze_dim)： (-q2, q1) = (-q2 sinθ, q1 sinθ)
+    # 两项相加得q' = (q1 cosθ - q2 sinθ, q2 cosθ + q1 sinθ)，符合旋转结果
     q_embed = ((q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))).to(q.dtype)
     k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
     return q_embed, k_embed
