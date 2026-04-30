@@ -164,3 +164,83 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
     return q_embed, k_embed
 
+# n_rep：每个KV头需要重复的次数
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    # 重复次数为1，不需要操作
+    if n_rep == 1: return x
+    # x[:, :, :, None, :]   形状从 (bs, slen, num_kv_heads, head_dim) 变为：(bs, slen, num_kv_heads, 1, head_dim)
+    # .expand(bs, slen, num_key_value_heads, n_rep, head_dim)  扩展第 3 维（原来是 1）到 n_rep 长度，不会复制数据。形状变为：(bs, slen, num_kv_heads, n_rep, head_dim)
+    # .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)  将后两维压平，最终形状为：(bs, slen, num_kv_heads × n_rep, head_dim)
+    return (x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
+
+
+class Attention(nn.Module):
+    # config是之前定义过的配置对象，包含一些参数
+    def __init__(self, config: MokioMindConfig):
+        super().__init__()
+        # 定义KV头数，如果配置中没有单独指定 KV 头数，则默认等于 Q 头数
+        self.num_key_value_heads = config.num_attention_heads if config.num_key_value_heads is None else config.num_key_value_heads
+        # Q头数，也是注意力头数
+        self.n_local_heads = config.num_attention_heads
+        # KV头数
+        self.n_local_kv_heads = self.num_key_value_heads
+        # 重复次数，即一对KV服务多少Q
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        # 头维度
+        self.head_dim = config.head_dim
+        self.is_causal = True
+
+        # 投影层
+        # QKV线性层属于输入Linear，输入维度都是config.hidden_size=512
+        # q_proj 输出：num_attention_heads × head_dim
+        # k_proj 输出：num_key_value_heads × head_dim
+        # v_proj 输出：num_key_value_heads × head_dim
+        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        # 输出Linear（在softmax之后的那层Linear），所以输入输出维度和前面相反
+        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+        # QK归一化，V不需要
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        # 注意力矩阵的dropout
+        self.attn_dropout = nn.Dropout(config.dropout)
+        # 输出后的dropout
+        self.resid_dropout = nn.Dropout(config.dropout)
+        # 保存 dropout 概率值
+        self.dropout = config.dropout
+        # 磁盘IO的计算，算attention更快
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
+
+    def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        bsz, seq_len, _ = x.shape
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xq, xk = self.q_norm(xq), self.k_norm(xk)
+        cos, sin = position_embeddings
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        past_kv = (xk, xv) if use_cache else None
+        xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
+        if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
+        else:
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
+            if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_kv
+
+
+
+
+
+
+
