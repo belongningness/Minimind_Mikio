@@ -27,25 +27,24 @@ class GQA(nn.Module):
         k = self.W_k(x)    # (b, len, head_dim * num_groups)
         v = self.W_v(x)    # (b, len, head_dim * num_groups)
         
-        """需要整理Q的维度:[B,L,D]->[B,L,g,gh,d]->[B,g,gh,L,d]
-           KV维度: [B,L,g*d]->[B,L,g,d]->[B,g,L,d]->[B,g,1,L,d]"""
-        # (b, len, group, g_heads, head_dim) -> (b, group, g_heads, len, head_dim)
+        # (b, len, num_groups, group_heads, head_dim) -> (b, num_groups, group_heads, len, head_dim)
         q = q.view(batch_size, seq_len, self.num_groups, self.group_heads, 
                    self.head_dim).permute(0, 2, 3, 1, 4) 
-        # (b, group, len, head_dim)
+        # (b, num_groups, len, head_dim)
         k = k.view(batch_size, seq_len, self.num_groups, self.head_dim).transpose(1, 2)  
-        # (b, group, len, head_dim)    
+        # (b, num_groups, len, head_dim)  
         v = v.view(batch_size, seq_len, self.num_groups, self.head_dim).transpose(1, 2)     
         
-        k = torch.unsqueeze(k, 2) # (b, group, 1, len, head_dim)
-        v = torch.unsqueeze(v, 2) # (b, group, 1, len, head_dim)
+        k = torch.unsqueeze(k, 2) # (b, num_groups, 1, len, head_dim)  
+        v = torch.unsqueeze(v, 2) # (b, num_groups, 1, len, head_dim)
 
         # Attention 
-         # (b, group, g_heads, len, len)
+        # (b, num_groups, group_heads, len, len)
         attention = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         attention = torch.softmax(attention, dim=-1)
         
-        """复原output原始维度:[B,g,gh,L,d]->[B,L,g,gh,d]->[B,L,D]"""
+        """复原output原始维度:(b, num_groups, group_heads, len, head_dim) -> 
+        (b, len, num_groups, group_heads, head_dim) -> (b, len, d_model)"""
         output = torch.matmul(attention, v) # (b, group, g_heads, len, head_dim)
         output = output.permute(0, 3, 1, 2, 4).contiguous().view(batch_size, -1, self.d_model)
 

@@ -7,16 +7,17 @@ class MHA(torch.nn.Module):
         super().__init__()
         self.d_model = d_model
 
-        """与自注意力SA的输入[B,L,D]相比, MHA存在H个头且需要输入头的维度d, 且D=H*d"""
+        """与自注意力SA的输入[B,L,D]相比, MHA存在H个头且需要输入头的维度d(d_model), 且D=H*d"""
         self.num_heads = num_heads
         assert d_model % num_heads == 0  # 确保嵌入维度可以被头的数量整除
         self.head_dim = d_model // num_heads  # 每个头的维度, //整除向下取整
 
         """SA只有一个head对应一套QKV, MHA每个head单独一套QKV线性层, 输入为嵌入维度D, 输出为头维度d
            MHA还需要FC层, 输入输出都是嵌入维度D"""
-        self.q_linear = nn.ModuleList([nn.Linear(d_model, self.head_dim, bias=False) for _ in range(num_heads)])
-        self.k_linear = nn.ModuleList([nn.Linear(d_model, self.head_dim, bias=False) for _ in range(num_heads)])
-        self.v_linear = nn.ModuleList([nn.Linear(d_model, self.head_dim, bias=False) for _ in range(num_heads)])
+        self.q_linear = nn.ModuleList([nn.Linear(d_model, self.head_dim) for _ in range(num_heads)])
+        self.k_linear = nn.ModuleList([nn.Linear(d_model, self.head_dim) for _ in range(num_heads)])
+        self.v_linear = nn.ModuleList([nn.Linear(d_model, self.head_dim) for _ in range(num_heads)])
+        # 在到达out_linear之前，会把格式还原为d_model
         self.out_linear = nn.Linear(d_model, d_model, bias=False)
 
     def forward(self, x):

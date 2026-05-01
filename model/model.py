@@ -213,28 +213,56 @@ class Attention(nn.Module):
         # 磁盘IO的计算，算attention更快
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
 
+    # 投影计算QKV，通过view把输入拆分为多个头，计算时QK需要用RoPE
     def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        # bsz：batchsize; seq_len：序列长度; _ 隐藏层维度
         bsz, seq_len, _ = x.shape
+        # 线性投影，x输入(bsz, seq_len, hidden_size)，输出xq：(bsz, seq_len, num_attention_heads × head_dim)
+        # 输出 xk/xv：(bsz, seq_len, num_key_value_heads × head_dim)
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        # 重塑为多头格式，将最后一维拆分为 (n_heads, head_dim)
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+
+        # QK归一化
         xq, xk = self.q_norm(xq), self.k_norm(xk)
+        # QK应用RoPE
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+
+        # KV cache
+        # past_key_value 存储了之前所有 token 的 K 和 V，将历史 KV 与当前新的 KV 拼接
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
+        # 如果 use_cache=True，返回更新后的 KV 供下一轮使用
         past_kv = (xk, xv) if use_cache else None
+
+        # transpose(1, 2): 转置：从 (bs, seq, heads, dim) → (bs, heads, seq, dim)
+        # repeat_kv: 将 KV 头数拓展到与Q头数一致
         xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
+
+        # 优化计算
         if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
+        # 标准注意力写法
         else:
+            # 计算注意力分数 QK^T/根号d
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            # 因果掩码，让每个位置只能看到当前及之前的位置，不能看到未来
+            # torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1) 创建上三角矩阵（不含对角线），上三角用-inf填充
+            # scores[:, :, :, -seq_len:] += 只修改最后 seq_len 个位置，因为可能拼接了历史 KV cache，历史部分已经处理过，不需要再次掩码
             if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
+            
+            # 自定义掩码，屏蔽特定位置，一般是padding token（填充令牌） ，为了让同一批次中不同长度的序列能够对齐而添加的特殊占位符
             if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+            
+            # dim=-1: 在最后一个维度（key 维度）上做 softmax，将注意力转为概率分布
             output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+        # 形状变化：(bsz, heads, seq_len, dim) → (bsz, seq_len, heads, dim)
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        # 输出层的linear + dropout正则化
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
 
