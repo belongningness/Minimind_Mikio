@@ -1,86 +1,13 @@
-import torch
-import torch.nn as nn
-import math
+import numpy as np
 
-class MHA(nn.Module):
-    def __init__(self, d_model, heads_num):
-        super().__init__()
-        self.d_model = d_model
-        self.heads_num = heads_num
-        assert d_model % heads_num == 0
-        self.head_dim = d_model // heads_num
+def BCE(pred, target):
+    eps = 1e-7
+    pred = np.clip(pred, eps, 1-eps)
 
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.o_proj = nn.Linear(d_model, d_model)
+    result = -(target * np.log(pred) + (1-target) * np.log(1-pred)) 
+    return np.mean(result)
 
-        self.cache_k = None
-        self.cache_v = None
-
-    def forward(self, x):
-        bs, seql, _ = x.shape
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-
-        q = q.view(bs, seql, self.heads_num, self.head_dim).transpose(1,2)
-        k = k.view(bs, seql, self.heads_num, self.head_dim).transpose(1,2)
-        v = v.view(bs, seql, self.heads_num, self.head_dim).transpose(1,2)
-
-        if self.cache_k is not None:
-            self.cache_k = torch.cat([self.cache_k, k], dim=-2)
-            self.cache_v = torch.cat([self.cache_v, v], dim=-2)
-        else:
-            self.cache_k = k
-            self.cache_v = v
-        k = self.cache_k
-        v = self.cache_v
-
-        total_len = k.shape[-2]
-
-        attention = q @ k.transpose(-1, -2) / math.sqrt(self.head_dim)
-        mask = torch.triu(torch.ones(seql, total_len), diagonal=1).bool()
-        mask = mask.unsqueeze(0).unsqueeze(0)
-        attention = attention.masked_fill(mask, float('-inf'))
-        attention = torch.softmax(attention, dim=-1)
-        output = attention @ v
-
-        output = output.transpose(-1,-2).view(bs, seql, -1)
-        return self.o_proj(output)
-    
-    def reset_cache(self):
-        self.cache_k = None
-        self.cache_v = None
-    
-if __name__ == "__main__":
-    print("="*60)
-    print("测试带KV Cache的MultiHeadAttention")
-    print("="*60)
-    
-    # 初始化模型
-    d_model = 512
-    num_heads = 8
-    mha = MHA(d_model, num_heads)
-
-    # 测试2: 使用KV Cache（自回归生成模拟）
-    print("\n2. 使用KV Cache - 模拟自回归生成")
-    mha.reset_cache()  # 重置缓存
-    
-    # 第一步：输入第一个token
-    x1 = torch.randn(2, 1, d_model)
-    out1 = mha(x1)
-    print(f"第1步 - 输入: {x1.shape}, 输出: {out1.shape}")
-    print(f"  缓存形状: K={mha.cache_k.shape}, V={mha.cache_v.shape}")
-    
-    # 第二步：输入第二个token
-    x2 = torch.randn(2, 1, d_model)
-    out2 = mha(x2)
-    print(f"第2步 - 输入: {x2.shape}, 输出: {out2.shape}")
-    print(f"  缓存形状: K={mha.cache_k.shape}, V={mha.cache_v.shape}")
-    
-    # 第三步：输入第三个token
-    x3 = torch.randn(2, 1, d_model)
-    out3 = mha(x3)
-    print(f"第3步 - 输入: {x3.shape}, 输出: {out3.shape}")
-    print(f"  缓存形状: K={mha.cache_k.shape}, V={mha.cache_v.shape}")
+pred = np.random.rand(2)
+target = np.array([0,1])
+print(pred)
+print(BCE(pred, target))
