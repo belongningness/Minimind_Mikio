@@ -344,7 +344,7 @@ class MiniMindBlock(nn.Module):
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-        residual = hidden_states
+        residual = hidden_states # 残差保存
         # GQA部分：先RMSNorm再GQA
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states), position_embeddings,
